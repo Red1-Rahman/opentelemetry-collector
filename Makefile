@@ -107,6 +107,22 @@ gogenerate:
 	@$(MAKE) for-all-target TARGET="generate"
 	$(MAKE) fmt
 
+.PHONY: check-generate-fmt
+check-generate-fmt:
+	cd cmd/mdatagen && $(GOCMD) install .
+	@set -e; \
+	export REAL_MDATAGEN=$$(command -v mdatagen); \
+	wrapper_dir=$$(mktemp -d); \
+	trap 'rm -rf "$$wrapper_dir"' EXIT; \
+	printf '#!/bin/sh\nexec "$$REAL_MDATAGEN" --noformat "$$@"\n' > "$$wrapper_dir/mdatagen"; \
+	chmod +x "$$wrapper_dir/mdatagen"; \
+	PATH="$$wrapper_dir:$$PATH" $(MAKE) for-all-target TARGET="generate"; \
+	offenders=$$(find . -type f -name 'generated_*.go' -print0 | xargs -0 -r gofmt -l); \
+	if [ -n "$$offenders" ]; then \
+		echo "$$offenders"; \
+		exit 1; \
+	fi
+
 .PHONY: govulncheck
 govulncheck:
 	@$(MAKE) for-all-target TARGET="vulncheck"
