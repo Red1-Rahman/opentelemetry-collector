@@ -3,11 +3,16 @@
 
 package internal // import "go.opentelemetry.io/collector/cmd/mdatagen/internal"
 
-import "embed"
+import (
+	"embed"
+	"io/fs"
+)
 
 // TemplateFS ensures that the files needed
 // to generate metadata as an embedded filesystem since
 // `go get` doesn't require these files to be downloaded.
 //
 //go:embed templates/*.tmpl templates/testdata/*.tmpl
-var TemplateFS embed.FS
+var templateFS embed.FS
+
+var TemplateFS fs.FS = templateFS

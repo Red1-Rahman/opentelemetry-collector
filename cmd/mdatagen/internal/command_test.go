@@ -6,12 +6,15 @@ package internal
 import (
 	"bytes"
 	"fmt"
+	"go/format"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -30,6 +33,105 @@ func TestNewCommand(t *testing.T) {
 	assert.IsType(t, &cobra.Command{}, cmd)
 	assert.Equal(t, "mdatagen", cmd.Use)
 	assert.True(t, cmd.SilenceUsage)
+}
+
+// These tests replace the package-level TemplateFS and must not call t.Parallel().
+func TestGenerateFileNoformat(t *testing.T) {
+	originalTemplateFS := TemplateFS
+	t.Cleanup(func() { TemplateFS = originalTemplateFS })
+	raw := []byte("package  metadata\n\nfunc  test() {\n    value := 1\n\t_ = value\n}\n")
+	formatted, err := format.Source(raw)
+	require.NoError(t, err)
+	TemplateFS = fstest.MapFS{
+		"templates/helper.tmpl":   {Data: []byte("")},
+		"templates/test.go.tmpl":  {Data: raw},
+		"templates/test.txt.tmpl": {Data: []byte("text\n")},
+	}
+
+	tests := []struct {
+		name     string
+		template string
+		noformat bool
+		want     []byte
+	}{
+		{name: "formatted Go output", template: "templates/test.go.tmpl", want: formatted},
+		{name: "raw Go output", template: "templates/test.go.tmpl", noformat: true, want: raw},
+		{name: "non-Go output with formatting", template: "templates/test.txt.tmpl", want: []byte("text\n")},
+		{name: "non-Go output", template: "templates/test.txt.tmpl", noformat: true, want: []byte("text\n")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputFile := filepath.Join(t.TempDir(), "output")
+			if strings.HasSuffix(tt.template, ".go.tmpl") {
+				outputFile += ".go"
+			} else {
+				outputFile += ".txt"
+			}
+			require.NoError(t, generateFile(tt.template, outputFile, Metadata{}, "metadata", "", tt.noformat))
+
+			got, err := os.ReadFile(outputFile)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// These tests replace the package-level TemplateFS and must not call t.Parallel().
+func TestCommandNoformatFlag(t *testing.T) {
+	originalTemplateFS := TemplateFS
+	t.Cleanup(func() { TemplateFS = originalTemplateFS })
+
+	templateFS := fstest.MapFS{}
+	require.NoError(t, fs.WalkDir(originalTemplateFS, ".", func(path string, entry fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		if entry.IsDir() {
+			return nil
+		}
+		content, readErr := fs.ReadFile(originalTemplateFS, path)
+		require.NoError(t, readErr)
+		templateFS[path] = &fstest.MapFile{Data: content}
+		return nil
+	}))
+	raw := []byte("package  shortname\n\nfunc  TestGenerated(t *testing.T) {\n    value := 1\n\t_ = value\n}\n")
+	templateFS["templates/package_test.go.tmpl"] = &fstest.MapFile{Data: raw}
+	TemplateFS = templateFS
+
+	tests := []struct {
+		name string
+		args []string
+		want []byte
+	}{
+		{name: "formatted", want: mustFormatGo(t, raw)},
+		{name: "noformat", args: []string{"--noformat"}, want: raw},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			metadata, err := os.ReadFile(filepath.Join("testdata", "basic_pkg.yaml"))
+			require.NoError(t, err)
+			metadataPath := filepath.Join(dir, "metadata.yaml")
+			require.NoError(t, os.WriteFile(metadataPath, metadata, 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module shortname\n"), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "doc.go"), []byte("package shortname\n"), 0o600))
+
+			cmd, err := NewCommand()
+			require.NoError(t, err)
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs(append(tt.args, metadataPath))
+			require.NoError(t, cmd.Execute())
+
+			got, err := os.ReadFile(filepath.Join(dir, "generated_package_test.go"))
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func mustFormatGo(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	formatted, err := format.Source(raw)
+	require.NoError(t, err)
+	return formatted
 }
 
 func TestCommandNoArgs(t *testing.T) {
@@ -385,7 +487,7 @@ foo
 			require.NoError(t, os.WriteFile(filepath.Join(tmpdir, generatedPackageDir, "generated_feature_gates.go"), []byte("// stale"), 0o600))
 			require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "documentation.md"), []byte("stale documentation"), 0o600))
 
-			err = run(metadataFile)
+			err = run(metadataFile, false)
 			if tt.wantOrderErr {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), "metadata.yaml ordering check failed")
@@ -645,7 +747,7 @@ func TestGenerateConfigFiles(t *testing.T) {
 			require.NoError(t, os.MkdirAll(tmpdir, 0o700))
 
 			require.NoError(t, os.WriteFile(filepath.Join(root, "go.mod"), []byte("module testmodule\n"), 0o600))
-			err := generateConfigFiles(tt.md, tmpdir, "testmodule")
+			err := generateConfigFiles(tt.md, tmpdir, "testmodule", false)
 			if tt.wantErr {
 				require.Error(t, err)
 				return
@@ -682,7 +784,7 @@ func TestGenerateConfigFiles_ExportedConfigsWithoutConfig(t *testing.T) {
 		},
 	}
 
-	err := generateConfigFiles(md, tmpdir, "testmodule")
+	err := generateConfigFiles(md, tmpdir, "testmodule", false)
 	require.NoError(t, err)
 
 	schema, err := os.ReadFile(filepath.Join(tmpdir, "config.schema.json")) // #nosec G304
@@ -724,7 +826,7 @@ func TestGenerateConfigFiles_ExportedConfigsWithConfig(t *testing.T) {
 		},
 	}
 
-	err := generateConfigFiles(md, tmpdir, "testmodule")
+	err := generateConfigFiles(md, tmpdir, "testmodule", false)
 	require.NoError(t, err)
 
 	schema, err := os.ReadFile(filepath.Join(tmpdir, "config.schema.json")) // #nosec G304
@@ -890,7 +992,7 @@ func TestGenerateConfigGoStruct_RootPackageError(t *testing.T) {
 			Config: &cfggen.ConfigMetadata{Type: "object"},
 		},
 	}
-	err := generateConfigGoStruct(md, t.TempDir())
+	err := generateConfigGoStruct(md, t.TempDir(), false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unable to determine root package")
 }
@@ -933,7 +1035,7 @@ func TestGenerateConfigGoStruct_ResolvedImports(t *testing.T) {
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
@@ -980,7 +1082,7 @@ func TestGenerateConfigGoStruct_NamedEmbeddedStruct(t *testing.T) {
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
@@ -1018,7 +1120,7 @@ func TestGenerateConfigGoStruct_PrivateFields(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, generateConfigGoStruct(md, outputDir))
+	require.NoError(t, generateConfigGoStruct(md, outputDir, false))
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
 	require.NoError(t, err)
@@ -1054,7 +1156,7 @@ func TestGenerateConfigGoStruct_PropertyDefaultsAndImports(t *testing.T) {
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
@@ -1091,7 +1193,7 @@ func TestGenerateConfigGoStruct_DeprecatedField(t *testing.T) {
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
@@ -1134,7 +1236,7 @@ func TestGenerateConfigGoStruct_InternalResolvedRefGeneratesLocalType(t *testing
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
@@ -1174,7 +1276,7 @@ func TestGenerateConfigGoStruct_ComponentIDFieldUsesGoName(t *testing.T) {
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
@@ -1209,7 +1311,7 @@ func TestGenerateConfigGoStruct_RequiredFieldWithoutDefaultOmitsOmitempty(t *tes
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
@@ -1231,7 +1333,7 @@ func TestGenerateConfigFiles_GoStructError(t *testing.T) {
 			Config: &cfggen.ConfigMetadata{Type: "object"},
 		},
 	}
-	err := generateConfigFiles(md, t.TempDir(), "testmodule")
+	err := generateConfigFiles(md, t.TempDir(), "testmodule", false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to generate config Go struct")
 }
@@ -1252,7 +1354,7 @@ func TestGenerateConfigFiles_InternalMetadataDefsError(t *testing.T) {
 		},
 	}
 
-	err := generateConfigFiles(md, t.TempDir(), "testmodule")
+	err := generateConfigFiles(md, t.TempDir(), "testmodule", false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unable to determine import root path")
 }
@@ -1270,7 +1372,7 @@ func TestGenerateConfigFiles_WriteError(t *testing.T) {
 			},
 		},
 	}
-	err := generateConfigFiles(md, "/nonexistent/path/that/does/not/exist", "testmodule")
+	err := generateConfigFiles(md, "/nonexistent/path/that/does/not/exist", "testmodule", false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to write config schema")
 }
@@ -1295,7 +1397,7 @@ func TestGenerateConfigFiles_EmptyImportRootPathFallsBackToRootPackage(t *testin
 
 	// importRootPath="" exercises the rootPkg=="" branch (lines 608-612) which falls back to
 	// helpers.RootPackage(mdDir) to determine the root package for the config doc template.
-	err := generateConfigFiles(md, tmpdir, "")
+	err := generateConfigFiles(md, tmpdir, "", false)
 	require.NoError(t, err)
 
 	contents, err := os.ReadFile(filepath.Clean(filepath.Join(tmpdir, "README.md")))
@@ -1325,7 +1427,7 @@ func TestGenerateConfigFiles_InlineReplaceError(t *testing.T) {
 		},
 	}
 
-	err := generateConfigFiles(md, tmpdir, "testmodule")
+	err := generateConfigFiles(md, tmpdir, "testmodule", false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to inject config doc into README")
 }
@@ -1352,7 +1454,7 @@ func TestRun(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := run(tt.args.ymlPath)
+			err := run(tt.args.ymlPath, false)
 			if !tt.wantErr {
 				require.NoError(t, err, "run()")
 			} else {
@@ -1752,7 +1854,7 @@ const (
 		t.Run(tt.name, func(t *testing.T) {
 			tmpdir := t.TempDir()
 			err := generateFile("templates/status.go.tmpl",
-				filepath.Join(tmpdir, "generated_status.go"), tt.md, "metadata", "go.opentelemetry.io/collector")
+				filepath.Join(tmpdir, "generated_status.go"), tt.md, "metadata", "go.opentelemetry.io/collector", false)
 			require.NoError(t, err)
 			actual, err := os.ReadFile(filepath.Clean(filepath.Join(tmpdir, "generated_status.go")))
 			require.NoError(t, err)
@@ -1838,7 +1940,7 @@ func Tracer(settings component.TelemetrySettings) trace.Tracer {
 		t.Run(tt.name, func(t *testing.T) {
 			tmpdir := t.TempDir()
 			err := generateFile("templates/telemetry.go.tmpl",
-				filepath.Join(tmpdir, "generated_telemetry.go"), tt.md, "metadata", "go.opentelemetry.io/collector")
+				filepath.Join(tmpdir, "generated_telemetry.go"), tt.md, "metadata", "go.opentelemetry.io/collector", false)
 			require.NoError(t, err)
 			actual, err := os.ReadFile(filepath.Clean(filepath.Join(tmpdir, "generated_telemetry.go")))
 			require.NoError(t, err)
@@ -1862,7 +1964,7 @@ func TestGenerateConfigGoStruct_GeneratesTestFile(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, generateConfigGoStruct(md, outputDir))
+	require.NoError(t, generateConfigGoStruct(md, outputDir, false))
 
 	require.FileExists(t, filepath.Join(outputDir, "generated_config.go"))
 	require.FileExists(t, filepath.Join(outputDir, "generated_config_test.go"))
@@ -1984,7 +2086,7 @@ foo
 
 	t.Setenv(sendingQueueOptOutEnvVar, "true")
 
-	require.NoError(t, run(metadataFile))
+	require.NoError(t, run(metadataFile, false))
 
 	statusPath := filepath.Join(tmpdir, "internal", "metadata", "generated_status.go")
 	require.FileExists(t, statusPath)
@@ -2024,7 +2126,7 @@ func TestGenerateConfigGoStruct_TestFileContainsValidateTestWhenValidatorsPresen
 		},
 	}
 
-	require.NoError(t, generateConfigGoStruct(md, outputDir))
+	require.NoError(t, generateConfigGoStruct(md, outputDir, false))
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config_test.go")) // #nosec G304
 	require.NoError(t, err)
@@ -2056,7 +2158,7 @@ func TestGenerateConfigGoStruct_TestFileNoValidateTestWhenNoValidators(t *testin
 		},
 	}
 
-	require.NoError(t, generateConfigGoStruct(md, outputDir))
+	require.NoError(t, generateConfigGoStruct(md, outputDir, false))
 
 	content, err := os.ReadFile(filepath.Join(outputDir, "generated_config_test.go")) // #nosec G304
 	require.NoError(t, err)
@@ -2098,7 +2200,7 @@ func TestGenerateConfigGoStruct_DefsOnlyConfigGeneratesLibraryTypes(t *testing.T
 		},
 	}
 
-	require.NoError(t, generateConfigGoStruct(md, outputDir))
+	require.NoError(t, generateConfigGoStruct(md, outputDir, false))
 
 	configGo, err := os.ReadFile(filepath.Join(outputDir, "generated_config.go")) // #nosec G304
 	require.NoError(t, err)
@@ -2142,7 +2244,7 @@ func TestGenerateConfigGoStruct_BothFileErrorsAccumulated(t *testing.T) {
 		},
 	}
 
-	err := generateConfigGoStruct(md, outputDir)
+	err := generateConfigGoStruct(md, outputDir, false)
 	require.Error(t, err)
 	// Both generated_config.go and generated_config_test.go writes fail; both errors must be present.
 	require.Contains(t, err.Error(), "generated_config.go")
@@ -2172,7 +2274,7 @@ func TestGenerateConfigSchema_LocalizesSameRootRefs(t *testing.T) {
 
 	tmpdir := t.TempDir()
 	outputFile := filepath.Join(tmpdir, "config.schema.yaml")
-	err := generateFile("templates/config.schema.yaml.tmpl", outputFile, md, "metadata", "go.opentelemetry.io/collector")
+	err := generateFile("templates/config.schema.yaml.tmpl", outputFile, md, "metadata", "go.opentelemetry.io/collector", false)
 	require.NoError(t, err)
 
 	actual, err := os.ReadFile(filepath.Clean(outputFile))
