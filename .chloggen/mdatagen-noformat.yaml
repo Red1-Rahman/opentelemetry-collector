@@ -1,0 +1,6 @@
+change_type: enhancement
+component: cmd/mdatagen
+note: "Add a `--noformat` flag to skip gofmt formatting of generated Go files."
+issues: [14698]
+subtext:
+change_logs: [user]
